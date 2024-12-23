@@ -1,11 +1,23 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
-const fs = require('fs');
 const csvWriter = require('csv-writer').createObjectCsvWriter;
+const schedule = require('node-schedule');
 
 // Verify token is present
 if (!process.env.DISCORD_TOKEN) {
     console.error('Error: DISCORD_TOKEN is not set in .env file');
+    process.exit(1);
+}
+
+// Fetch extraction configuration from .env
+const extractionChannelId = process.env.EXTRACTION_CHANNEL_ID;
+const targetChannelId = process.env.TARGET_CHANNEL_ID;
+const autoExtractStartTime = process.env.AUTO_EXTRACT_START_TIME || '00:00';
+const autoExtractEndTime = process.env.AUTO_EXTRACT_END_TIME || '23:59';
+
+// Validate environment variables
+if (!extractionChannelId || !targetChannelId) {
+    console.error('Error: Channel IDs are not set in the .env file.');
     process.exit(1);
 }
 
@@ -23,38 +35,119 @@ const client = new Client({
 const allowedRoles = ['the creator', 'Botanix Team', 'Lead Spider'];
 
 // Regex for Ethereum addresses
-const ethAddressRegex = /0x[a-fA-F0-9]{40}/g;
+const ethAddressRegex = /\b0x[a-fA-F0-9]{40}\b/g;
 
-// Function to validate and parse date
+// Function to get extraction start date based on configuration
+function getExtractionStartDate() {
+    const startDateConfig = process.env.AUTO_EXTRACT_START_DATE || 'prev-day';
+
+    if (startDateConfig === 'prev-day') {
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - 1); // Go back one day
+        startDate.setHours(0, 0, 0, 0); // Start at midnight
+        return startDate;
+    }
+
+    if (startDateConfig === 'today') {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0); // Start at midnight
+        return today;
+    }
+
+    // If a specific date is set, parse it
+    try {
+        const parsedDate = new Date(startDateConfig);
+        if (isNaN(parsedDate.getTime())) {
+            throw new Error(`Invalid AUTO_EXTRACT_START_DATE: ${startDateConfig}.`);
+        }
+        return parsedDate;
+    } catch (error) {
+        console.error('Invalid AUTO_EXTRACT_START_DATE. Defaulting to previous day.');
+        const fallbackDate = new Date();
+        fallbackDate.setDate(fallbackDate.getDate() - 1);
+        fallbackDate.setHours(0, 0, 0, 0);
+        return fallbackDate;
+    }
+}
+
+// Function to get extraction end date based on configuration
+function getExtractionEndDate() {
+    const endDateConfig = process.env.AUTO_EXTRACT_END_DATE || 'today';
+
+    if (endDateConfig === 'prev-day') {
+        const endDate = new Date();
+        endDate.setDate(endDate.getDate() - 1); // Go back one day
+        endDate.setHours(23, 59, 59, 999); // End of previous day
+        return endDate;
+    }
+
+    if (endDateConfig === 'today') {
+        const today = new Date();
+        today.setHours(23, 59, 59, 999); // End of today
+        return today;
+    }
+
+    // If a specific date is set, parse it
+    try {
+        const parsedDate = new Date(endDateConfig);
+        if (isNaN(parsedDate.getTime())) {
+            throw new Error(`Invalid AUTO_EXTRACT_END_DATE: ${endDateConfig}.`);
+        }
+        parsedDate.setHours(23, 59, 59, 999); // Set to end of day
+        return parsedDate;
+    } catch (error) {
+        console.error('Invalid AUTO_EXTRACT_END_DATE. Defaulting to today.');
+        const fallbackDate = new Date();
+        fallbackDate.setHours(23, 59, 59, 999);
+        return fallbackDate;
+    }
+}
+
+// Function to set start and end times
+function setDateTime(date, timeString, isEndTime = false) {
+    const [hours, minutes] = timeString.split(':').map(Number);
+    
+    if (isEndTime) {
+        date.setHours(hours, minutes, 59, 999);
+    } else {
+        date.setHours(hours, minutes, 0, 0);
+    }
+    
+    return date;
+}
+
+// Function to validate and parse date input with optional time
 function parseDateInput(dateArg) {
-    // Check if input is a single date or a range
     const currentYear = new Date().getFullYear();
     
-    // Regex to match full YYYY-MM-DD or MM-DD for current year
-    const dateRangeMatch = dateArg.match(/^(?:(\d{4})-)?(\d{2}-\d{2})(?:,(?:(\d{4})-)?(\d{2}-\d{2}))?$/);
+    // Updated regex to support optional time
+    const dateTimeRegex = /^(?:(\d{4})-)?(\d{2}-\d{2})(?:\s+(\d{2}):(\d{2}))?(?:,(?:(\d{4})-)?(\d{2}-\d{2})(?:\s+(\d{2}):(\d{2}))?)?$/;
+    const dateRangeMatch = dateArg.match(dateTimeRegex);
     
     if (!dateRangeMatch) {
-        throw new Error('Invalid date format. Use YYYY-MM-DD, MM-DD, or date ranges with optional year');
+        throw new Error('Invalid date format. Use YYYY-MM-DD HH:MM or MM-DD HH:MM, or date ranges');
     }
 
-    // Determine start date
+    // Parse start date and time
     const startYear = dateRangeMatch[1] ? parseInt(dateRangeMatch[1]) : currentYear;
     const startDateStr = `${startYear}-${dateRangeMatch[2]}`;
+    const startHours = dateRangeMatch[3] ? parseInt(dateRangeMatch[3]) : 0;
+    const startMinutes = dateRangeMatch[4] ? parseInt(dateRangeMatch[4]) : 0;
     const startDate = new Date(startDateStr);
+    startDate.setHours(startHours, startMinutes, 0, 0);
 
-    // Determine end date (use start date's year if not specified)
-    const endYear = dateRangeMatch[3] ? parseInt(dateRangeMatch[3]) : 
-                    dateRangeMatch[4] ? startYear : startYear;
-    const endDateStr = dateRangeMatch[4] ? 
-        `${endYear}-${dateRangeMatch[4]}` : 
-        `${endYear}-${dateRangeMatch[2]}`;
+    // Parse end date and time (use start date/time if not specified)
+    const endYear = dateRangeMatch[5] ? parseInt(dateRangeMatch[5]) : startYear;
+    const endDateStr = dateRangeMatch[6] ? `${endYear}-${dateRangeMatch[6]}` : startDateStr;
+    const endHours = dateRangeMatch[7] ? parseInt(dateRangeMatch[7]) : 23;
+    const endMinutes = dateRangeMatch[8] ? parseInt(dateRangeMatch[8]) : 59;
     const endDate = new Date(endDateStr);
+    endDate.setHours(endHours, endMinutes, 59, 999);
 
     if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-        throw new Error('Invalid date format. Use YYYY-MM-DD, MM-DD, or date ranges with optional year');
+        throw new Error('Invalid date format. Use YYYY-MM-DD HH:MM or MM-DD HH:MM, or date ranges');
     }
 
-    // Ensure correct date order
     if (startDate > endDate) {
         [startDate, endDate] = [endDate, startDate];
     }
@@ -62,18 +155,61 @@ function parseDateInput(dateArg) {
     return { startDate, endDate };
 }
 
-// Log in the bot
-client.once('ready', () => {
-    console.log(`Logged in as ${client.user.tag}!`);
-});
+// Function to extract messages
+async function extractMessages(channel, startDate, endDate, filePath) {
+    const lastAddressPerUser = new Map();
 
+    let lastMessageId = null;
+
+    while (true) {
+        const fetchedMessages = await channel.messages.fetch({
+            limit: 100,
+            before: lastMessageId,
+        });
+
+        if (fetchedMessages.size === 0) break;
+
+        fetchedMessages.forEach(msg => {
+            const msgDate = new Date(msg.createdTimestamp);
+
+            if (msgDate >= startDate && msgDate <= endDate) {
+                const addresses = msg.content.match(ethAddressRegex);
+
+                if (addresses) {
+                    for (let address of [...addresses].reverse()) {
+                        if (!lastAddressPerUser.has(msg.author.id)) {
+                            lastAddressPerUser.set(msg.author.id, address);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        lastMessageId = fetchedMessages.last()?.id;
+    }
+
+    const evmAddresses = Array.from(lastAddressPerUser.values());
+    if (evmAddresses.length === 0) {
+        console.log('No unique EVM addresses found for the specified range.');
+        return false;
+    }
+
+    const csvWriterInstance = csvWriter({
+        path: filePath,
+        header: [{ id: 'address', title: 'EVM Address' }],
+    });
+
+    await csvWriterInstance.writeRecords(evmAddresses.map(addr => ({ address: addr })));
+    console.log(`CSV file created: ${filePath}`);
+    return true;
+}
+
+// Manual extraction command
 client.on('messageCreate', async (message) => {
-    // Ignore messages from bots
     if (message.author.bot) return;
 
-    // Check if the message starts with the bot command
     if (message.content.startsWith('!extract')) {
-        // Check if the user has one of the allowed roles
         const member = await message.guild.members.fetch(message.author.id);
         const hasRole = member.roles.cache.some(role => allowedRoles.includes(role.name));
 
@@ -81,88 +217,101 @@ client.on('messageCreate', async (message) => {
             return message.reply('You do not have permission to use this command.');
         }
 
-        // Extract parameters from the command
         const args = message.content.split(' ');
         if (args.length < 2) {
-            return message.reply('Usage: `!extract YYYY-MM-DD` or `!extract YYYY-MM-DD,YYYY-MM-DD` or `!extract MM-DD` or `!extract MM-DD,MM-DD`');
+            return message.reply('Usage: `!extract YYYY-MM-DD [HH:MM]` or `!extract MM-DD [HH:MM]` or date ranges');
         }
-        
-        try {
-            const { startDate, endDate } = parseDateInput(args[1]);
 
-            const channel = message.channel;
-            const userAddresses = new Map(); // Map to store last address for each user
-            const uniqueAddresses = new Set(); // Set to track unique addresses across all users
-            let lastMessageId = null;
+try {
+    // Reconstruct the date argument (in case it was split)
+    const dateArg = args.slice(1).join(' ');
+    const { startDate, endDate } = parseDateInput(dateArg);
+    const extractionChannel = message.channel; // The channel where the command was issued
+    const targetChannelId = process.env.TARGET_CHANNEL_ID; // Fetch from .env
+    if (!targetChannelId) {
+        message.reply('Error: Target channel is not defined in the .env file.');
+        return;
+    }
 
-            // Fetch messages in chunks
-            while (true) {
-                const fetchedMessages = await channel.messages.fetch({
-                    limit: 100,
-                    before: lastMessageId,
-                });
+    const targetChannel = await client.channels.fetch(targetChannelId).catch(() => null);
+    if (!targetChannel) {
+        message.reply(`Error: Could not fetch the target channel with ID ${targetChannelId}.`);
+        return;
+    }
 
-                if (fetchedMessages.size === 0) break;
+    // Add this line to define filePath
+    const filePath = `./${dateArg.replace(/\s+/g, '_').replace(',', '_to_')}.csv`;
 
-                fetchedMessages.forEach(msg => {
-                    const msgDate = new Date(msg.createdTimestamp);
-                    
-                    // Check if message is within the date range
-                    if (msgDate >= startDate && msgDate <= new Date(endDate.getTime() + 86400000)) { // Add full day
-                        // Find all addresses in the message
-                        const addresses = msg.content.match(ethAddressRegex);
-                        
-                        // If addresses found, update the last address for this user
-                        if (addresses) {
-                            // Reverse to get the last address first
-                            for (let address of [...addresses].reverse()) {
-                                // Only keep if address hasn't been seen before
-                                if (!uniqueAddresses.has(address)) {
-                                    userAddresses.set(msg.author.id, address);
-                                    uniqueAddresses.add(address);
-                                    break; // Stop after finding first unique address
-                                }
-                            }
-                        }
-                    }
-                });
+    const success = await extractMessages(extractionChannel, startDate, endDate, filePath);
 
-                lastMessageId = fetchedMessages.last()?.id;
-            }
-
-            // Convert Map to array of addresses
-            const evmAddresses = Array.from(userAddresses.values());
-
-            if (evmAddresses.length === 0) {
-                return message.reply('No unique EVM addresses found for the specified date range.');
-            }
-
-            // Write to CSV
-            const filePath = `./${args[1].replace(',', '_to_')}.csv`;
-            const csvWriterInstance = csvWriter({
-                path: filePath,
-                header: [{ id: 'address', title: 'EVM Address' }],
-            });
-
-            await csvWriterInstance.writeRecords(evmAddresses.map(addr => ({ address: addr })));
-
-            // Reply with the CSV file and pin the message
-            const replyMessage = await message.reply({
-                content: `${args[1]} Here are the extracted unique EVM addresses:`,
-                files: [filePath],
-            });
-
-            // Pin the reply message
-            try {
-                await replyMessage.pin();
-            } catch (error) {
-                console.error('Failed to pin the message:', error);
-            }
+			if (success) {
+				const sentMessage = await targetChannel.send({
+					content: `Here are the extracted addresses for ${dateArg}:`,
+					files: [filePath],
+				});
+				await sentMessage.pin();
+				message.reply(`The extracted addresses have been sent to <#${targetChannelId}>.`);
+			} else {
+				message.reply('No addresses were found in the specified date range.');
+			}                       
         } catch (error) {
             message.reply(error.message);
         }
     }
 });
 
-// Login the bot
+// Get schedule time from .env, default to daily at midnight
+const autoExtractScheduleTime = process.env.AUTO_EXTRACT_SCHEDULE_TIME || '0 0 * * *';
+
+// Scheduled extraction
+schedule.scheduleJob(autoExtractScheduleTime, async () => {
+    console.log('Running automated extraction...');
+    try {
+        const targetChannel = await client.channels.fetch(targetChannelId);
+        const extractionChannel = await client.channels.fetch(extractionChannelId);
+
+        if (!targetChannel || !extractionChannel) {
+            console.error('One or both channels not found. Check the channel IDs in the .env file.');
+            return;
+        }
+
+        // Get extraction dates
+        const startDate = getExtractionStartDate();
+        const endDate = getExtractionEndDate();
+
+        // Override with specific times if provided in .env
+        setDateTime(startDate, autoExtractStartTime);
+        setDateTime(endDate, autoExtractEndTime, true);
+
+        // Ensure start date is before end date
+        if (startDate > endDate) {
+            [startDate, endDate] = [endDate, startDate];
+        }
+
+        // Generate CSV file path
+        const filePath = `./autoextract_${startDate.toISOString().replace(/:/g, '-').replace('T', '_').slice(0, 16)}_to_${endDate.toISOString().replace(/:/g, '-').replace('T', '_').slice(0, 16)}.csv`;
+
+        // Perform message extraction
+        const success = await extractMessages(extractionChannel, startDate, endDate, filePath);
+
+        if (success) {
+            const sentMessage = await targetChannel.send({
+                content: `Here is the automated extraction from **${startDate.toISOString().split('T')[0]}** to **${endDate.toISOString().split('T')[0]}**.`,
+                files: [filePath],
+            });
+            await sentMessage.pin();
+            console.log('File sent and message pinned successfully.');
+        } else {
+            console.log('No addresses found for the specified date range.');
+        }
+    } catch (error) {
+        console.error('Error during scheduled extraction:', error);
+    }
+});
+
+// Log in the bot
+client.once('ready', () => {
+    console.log(`Logged in as ${client.user.tag}!`);
+});
+
 client.login(process.env.DISCORD_TOKEN);
