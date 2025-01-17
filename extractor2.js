@@ -2,6 +2,8 @@ require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
 const csvWriter = require('csv-writer').createObjectCsvWriter;
 const schedule = require('node-schedule');
+const fs = require('fs');
+const path = require('path');
 
 // Verify token is present
 if (!process.env.DISCORD_TOKEN) {
@@ -255,12 +257,17 @@ client.on('messageCreate', async (message) => {
             const success = await extractMessages(extractionChannel, startDate, endDate, filePath);
 
             if (success) {
-                const sentMessage = await targetChannel.send({
-                    content: `Here are the extracted addresses for ${dateArg}:`,
-                    files: [filePath],
-                });
-                await sentMessage.pin();
-                message.reply(`The extracted addresses have been sent to <#${targetChannelId}>.`);
+                // Check if the file exists before sending
+                if (fs.existsSync(filePath)) {
+                    const sentMessage = await targetChannel.send({
+                        content: `Here are the extracted addresses for ${dateArg}:`,
+                        files: [filePath],
+                    });
+                    await sentMessage.pin();
+                    message.reply(`The extracted addresses have been sent to <#${targetChannelId}>.`);
+                } else {
+                    message.reply('Extraction file does not exist.');
+                }
             } else {
                 message.reply('No addresses were found in the specified date range.');
             }                       
@@ -299,18 +306,23 @@ schedule.scheduleJob(autoExtractScheduleTime, async () => {
         }
 
         // Generate CSV file path
-        const filePath = `./autoextract_${startDate.toISOString().replace(/:/g, '-').replace('T', '_').slice(0, 16)}_to_${endDate.toISOString().replace(/:/g, '-').replace('T', '_').slice(0, 16)}.csv`;
+        const filePath = path.resolve(`./autoextract_${startDate.toISOString().replace(/:/g, '-').replace('T', '_').slice(0, 16)}_to_${endDate.toISOString().replace(/:/g, '-').replace('T', '_').slice(0, 16)}.csv`);
 
         // Perform message extraction
         const success = await extractMessages(extractionChannel, startDate, endDate, filePath);
 
         if (success) {
-            const sentMessage = await targetChannel.send({
-                content: `Here is the automated extraction from **${startDate.toISOString().split('T')[0]}** to **${endDate.toISOString().split('T')[0]}**.`,
-                files: [filePath],
-            });
-            await sentMessage.pin();
-            console.log('File sent and message pinned successfully.');
+            // Check if the file exists before sending
+            if (fs.existsSync(filePath)) {
+                const sentMessage = await targetChannel.send({
+                    content: `Here is the automated extraction from **${startDate.toISOString().split('T')[0]}** to **${endDate.toISOString().split('T')[0]}**.`,
+                    files: [filePath],
+                });
+                await sentMessage.pin();
+                console.log('File sent and message pinned successfully.');
+            } else {
+                console.error('File does not exist:', filePath);
+            }
         } else {
             console.log('No addresses found for the specified date range.');
         }
